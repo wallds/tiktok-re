@@ -68,6 +68,11 @@ class Inst(ctypes.Union):
         return (self.v1.imm0 << 12) | (self.v1.imm1 << 6) | (self.v1.imm2)
 
     @property
+    def imm_ext(self):
+        assert self.v1.opcode not in [1, 0x3E]
+        return (self.v1.src << 21) | (self.v1.dst << 16) | (self.v1.imm0 << 12) | (self.v1.imm1 << 6) | (self.v1.imm2)
+
+    @property
     def opcode(self):
         return self.v2.opcode
 
@@ -80,7 +85,7 @@ templ = """
 #include <stdint.h>
 #include <stdio.h>
 
-void foo(uint64_t r4 /*args*/, uint64_t r5 /*g_vars*/, uint64_t r6 /*funcs*/, uint64_t r7 /*stub*/) {
+void ${name}(uint64_t r4 /*args*/, uint64_t r5 /*g_vars*/, uint64_t r6 /*funcs*/, uint64_t r7 /*stub*/) {
   uint64_t r0 = 0;
   uint64_t r1 = 0;
   uint64_t r2 = 0;
@@ -112,15 +117,15 @@ void foo(uint64_t r4 /*args*/, uint64_t r5 /*g_vars*/, uint64_t r6 /*funcs*/, ui
   uint64_t field_120 = 0;
   uint64_t field_128 = 0;
 
-  uint8_t stack_buffer[0x10000];
-  uint64_t r29 = (uint64_t)&stack_buffer[sizeof(stack_buffer)/2];
+  uint8_t stack_buffer[0x8000];
+  uint64_t r29 = (uint64_t)&stack_buffer[sizeof(stack_buffer)];
 
 ${pcode}
 
 }
 
 int main(void) {
-  printf("%p", foo);
+  printf("%p", ${name});
   return 0;
 }
 """
@@ -287,7 +292,7 @@ def decompile(vm: VMInfo, gen_c=False):
                 case 0x2F:
                     text = f"r{inst.dst} = (int32_t)r{inst.src} + (int64_t){hex(imm_s)};"
                 case 0x09:
-                    text = f"goto {label(vm.vmentry+inst.imm*4)};"
+                    text = f"goto {label(vm.vmentry+inst.imm_ext*4)};"
                 case 0x24:
                     text = f"r{inst.dst} = (int64_t)r{inst.src} < {imm_s};"
                 case 0x1E:
@@ -339,7 +344,7 @@ def decompile(vm: VMInfo, gen_c=False):
 
     if gen_c:
         open(f"vm_{vm.vmentry:08X}_{vm.size}.c", "w").write(
-            templ_obj.substitute(pcode=s))
+            templ_obj.substitute(name=f'foo_{vm.vmentry:08X}', pcode=s))
         # 生成后直接用gcc编译, 然后使用IDA打开分析.
 
 
