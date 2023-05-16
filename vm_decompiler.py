@@ -1,10 +1,19 @@
 import ctypes
 from ctypes import c_int16, c_uint32
 from string import Template
+from idc import *
+import idaapi
+import ida_hexrays
 import ida_bytes
 import ida_kernwin
+import importlib
+import sys
+import idautils
+from ops import TiktokOps
 
-# tiktok-26-1-1.apk libmetasec_ov.so
+if 'ops' in sys.modules:
+    importlib.reload(sys.modules['ops'])
+    from ops import TiktokOps
 
 """
 用于定位VM函数
@@ -58,18 +67,19 @@ class Inst(ctypes.Union):
 
     @property
     def ext(self):
-        assert self.v2.opcode in [1, 0x3E]
+        assert self.v2.opcode in [TiktokOps.V2_OPCODE1, TiktokOps.V2_OPCODE2]
         return (self.v2.ext0 << 1) | self.v2.ext1
 
     @property
     def imm(self):
-        if self.v2.opcode in [1, 0x3E]:
+        if self.v2.opcode in [TiktokOps.V2_OPCODE1, TiktokOps.V2_OPCODE2]:
             return self.v2.imm
         return (self.v1.imm0 << 12) | (self.v1.imm1 << 6) | (self.v1.imm2)
 
     @property
     def imm_ext(self):
-        assert self.v1.opcode not in [1, 0x3E]
+        assert self.v1.opcode not in [
+            TiktokOps.V2_OPCODE1, TiktokOps.V2_OPCODE2]
         return (self.v1.src << 21) | (self.v1.dst << 16) | (self.v1.imm0 << 12) | (self.v1.imm1 << 6) | (self.v1.imm2)
 
     @property
@@ -81,15 +91,23 @@ class Inst(ctypes.Union):
         return self.v2.opcode_ext
 
 
-templ = """
+headers = """
 #include <stdint.h>
 #include <stdio.h>
 
-void ${name}(uint64_t r4 /*args*/, uint64_t r5 /*g_vars*/, uint64_t r6 /*funcs*/, uint64_t r7 /*stub*/) {
+typedef void (*PFN_CALLSTUB)(uint64_t, void *);
+"""
+
+templ = """
+void ${name}(uint64_t *p_args, uint64_t *g_vars, uint64_t *p_funcs, PFN_CALLSTUB callstub) {
   uint64_t r0 = 0;
   uint64_t r1 = 0;
   uint64_t r2 = 0;
   uint64_t r3 = 0;
+  uint64_t r4 = (uint64_t)p_args;
+  uint64_t r5 = (uint64_t)g_vars;
+  uint64_t r6 = (uint64_t)p_funcs;
+  uint64_t r7 = (uint64_t)callstub;
   uint64_t r8 = 0;
   uint64_t r9 = 0;
   uint64_t r10 = 0;
@@ -117,15 +135,16 @@ void ${name}(uint64_t r4 /*args*/, uint64_t r5 /*g_vars*/, uint64_t r6 /*funcs*/
   uint64_t field_120 = 0;
   uint64_t field_128 = 0;
 
-  uint8_t stack_buffer[0x8000];
+  uint8_t stack_buffer[${stack_size}];
   uint64_t r29 = (uint64_t)&stack_buffer[sizeof(stack_buffer)];
 
 ${pcode}
 
 }
+"""
 
+footers = """
 int main(void) {
-  printf("%p", ${name});
   return 0;
 }
 """
@@ -140,39 +159,8 @@ class VMInfo():
         self.g_vars = g_vars
         self.funcs = funcs
 
-
-vms = [
-    VMInfo(0xD3350, 360, 0, 0x116450),
-
-    VMInfo(0xD3D70, 68, 0, 0x1169A0),
-
-    VMInfo(0xD4BB0, 420, 0x1173C0, 0x1173E0),
-    VMInfo(0xD5240, 404, 0x117490, 0x1174B0),
-
-    VMInfo(0xD6F90, 42, 0x117A58, 0),
-
-    VMInfo(0xD7950, 36, 0, 0),
-    VMInfo(0xD79E0, 16, 0, 0),
-    VMInfo(0xD7A20, 2315, 0x1181D0, 0x1182A0),
-    VMInfo(0xD9E50, 48, 0, 0x1184B0),
-    VMInfo(0xD9F10, 412, 0x1184D0, 0x118510),
-    VMInfo(0xDA580, 1351, 0x1185B0, 0x1185E0),
-    VMInfo(0xDBAA0, 37, 0, 0),
-    VMInfo(0xDBB40, 24, 0, 0),
-    VMInfo(0xDBBA0, 24, 0, 0),
-
-    VMInfo(0xDC630, 491, 0x119AC0, 0x119AE0),
-
-    VMInfo(0xDD200, 420, 0, 0x11A170),
-    VMInfo(0xDD890, 464, 0, 0x11A210),
-
-    VMInfo(0xDE440, 316, 0, 0x11B1D0),
-    VMInfo(0xDE930, 152, 0, 0x11B270),
-    VMInfo(0xDEB90, 384, 0x11B2C0, 0x11B2D0),
-    VMInfo(0xDF190, 581, 0x11B388, 0x11B3A0),
-
-    VMInfo(0xDFE40, 504, 0x11B8C8, 0x11B8E0),
-]
+    def __str__(self) -> str:
+        return f'VMInfo(vmentry=0x{self.vmentry:08X}, size={self.size}, g_vars=0x{self.g_vars:08X}, funcs=0x{self.funcs:08X})'
 
 
 class Pcode:
@@ -187,68 +175,72 @@ class Pcode:
 def decompile(vm: VMInfo, gen_c=False):
     def label(pc):
         return f"L_{pc:08X}"
-
+    stack_size = 0
     pcodes = []
     for i in range(vm.size):
         pc = vm.vmentry + i * 4
         inst = Inst(ida_bytes.get_dword(pc))
         if inst.asdword == 0:
             break
-        if inst.opcode in [1, 0x3E]:
-            text = f"/*v2 {inst.opcode_ext:02X} {inst.asdword:08X}*/ d:r{inst.dst} s:r{inst.src} x:r{inst.ext} imm:{inst.imm}"
-            if inst.opcode == 1:
+        if inst.opcode in [TiktokOps.V2_OPCODE1, TiktokOps.V2_OPCODE2]:
+            text = f'puts("/*v2 {inst.opcode_ext:02X} {inst.asdword:08X}*/ d:r{inst.dst} s:r{inst.src} x:r{inst.ext} imm:{inst.imm}");'
+            if inst.opcode == TiktokOps.V2_OPCODE1:
                 match inst.opcode_ext:
-                    case 0x04:
-                        text = f"field_120 = (int32_t)((int64_t)(int32_t)r{inst.dst}*(int64_t)(int32_t)r{inst.src}); field_128 = ((int64_t)(int32_t)r{inst.dst}*(int64_t)(int32_t)r{inst.src}) >> 32;"
-                    case 0x0F:
+                    case TiktokOps.V2_MUL_I32:
+                        text = f"field_120 = (int32_t)((int64_t)(int32_t)r{inst.dst}*(int64_t)(int32_t)r{inst.src});"
+                        text += f"field_128 = ((int64_t)(int32_t)r{inst.dst}*(int64_t)(int32_t)r{inst.src}) >> 32;"
+                    case TiktokOps.V2_GET_PRODUCT_LOW:
+                        text = f"r{inst.ext} = field_120;"
+                    case TiktokOps.V2_GET_PRODUCT_HIGH:
                         text = f"r{inst.ext} = field_128;"
-                    case 0x13:
+                    case TiktokOps.V2_NOR:
                         text = f"r{inst.ext} = ~(r{inst.dst} | r{inst.src});"
-                    case 0x09:
+                    case TiktokOps.V2_AND:
                         text = f"r{inst.ext} = r{inst.dst} & r{inst.src};"
-                    case 0x30:
+                    case TiktokOps.V2_OR:
                         text = f"r{inst.ext} = r{inst.dst} | r{inst.src};"
-                    case 0x31:
+                    case TiktokOps.V2_XOR:
                         text = f"r{inst.ext} = r{inst.dst} ^ r{inst.src};"
-                    case 0x2C:
+                    case TiktokOps.V2_SAR_I32:
                         text = f"r{inst.ext} = (int32_t)r{inst.dst} >> {inst.imm};"
-                    case 0x0A:
+                    case TiktokOps.V2_SAL_I32:
                         text = f"r{inst.ext} = (int32_t)((uint32_t)r{inst.dst} << {inst.imm});"
-                    case 0x15:
+                    case TiktokOps.V2_SHR_U32:
                         text = f"r{inst.ext} = (int32_t)((uint32_t)r{inst.dst} >> {inst.imm});"
-                    case 0x01:
+                    case TiktokOps.V2_SHL_X:
                         text = f"r{inst.ext} = r{inst.dst} << {inst.imm|0x20};"
-                    case 0x17:
+                    case TiktokOps.V2_SHL:
                         text = f"r{inst.ext} = r{inst.dst} << {inst.imm};"
-                    case 0x16:  # NOP ?
-                        text = ';/* nop */'
-                        pass
-                    case 0x3C:
-                        text = f"((void (*)(uint64_t, uint64_t))r{inst.src})(r4, r5); /* call r{inst.src}(r4, r5) */"
-                    case 0x34:
+                    # case 0x16:  # NOP ?
+                    #     text = ';/* nop */'
+                    #     pass
+                    case TiktokOps.V2_SYSCALL:  # V2_SYSCALL
+                        text = f"((PFN_CALLSTUB)r{inst.src})(r4, (void *)r5); /* call r{inst.src}(r4, r5) */"
+                        # text = f"((void (*)(void *))r4)((void *)r5); /* call r{inst.src}(r4, r5) */"
+                    case TiktokOps.V2_RETURN:  # V2_RETURN
                         text = f"return; // d:r{inst.dst} s:r{inst.src} x:r{inst.ext} imm:{inst.imm};"
-                    case 0x29:
+                    case TiktokOps.V2_SUB | TiktokOps.V2_SUB_1:  # V2_SUB
                         text = f"r{inst.ext} = r{inst.src} - r{inst.dst};"
-                    case 0x32:
+                    case TiktokOps.V2_ADD | TiktokOps.V2_ADD_1:  # V2_ADD
                         text = f"r{inst.ext} = r{inst.dst} + r{inst.src};"
-                    case 0x2B:
+                    case TiktokOps.V2_CMP_U64:
                         text = f"r{inst.ext} = r{inst.src} < r{inst.dst};"
-                    case 0x2D:
+                    case TiktokOps.V2_CMP_I64:
                         text = f"r{inst.ext} = (int64_t)r{inst.src} < (int64_t)r{inst.dst};"
-                    case 0x18:
+                    case TiktokOps.V2_ADD_I32 | TiktokOps.V2_ADD_I32_1:
                         text = f"r{inst.ext} = (int32_t)((uint32_t)r{inst.dst} + (uint32_t)r{inst.src});"
-                    case 0x39:
+                    case TiktokOps.V2_SUB_I32 | TiktokOps.V2_SUB_I32_1:
                         text = f"r{inst.ext} = (int32_t)((uint32_t)r{inst.src} - (uint32_t)r{inst.dst});"
-                    case 0x1F:
+                    case TiktokOps.V2_MOVEQ:
                         text = f"if (r{inst.dst}) r{inst.ext} = r{inst.src};"
-                    case 0x2E:
+                    case TiktokOps.V2_MOVNE:
                         text = f"if (!r{inst.dst}) r{inst.ext} = r{inst.src};"
-                    case 0x10:
-                        text = f"r{inst.ext} = (r{inst.dst} >> {inst.imm|0x20}) | (r{inst.dst} << {64-(inst.imm|0x20)});"
-                    case 0x3E:
-                        text = f"r{inst.ext} = (r{inst.dst} >> {inst.imm}) | (r{inst.dst} << {64-inst.imm});"
-            elif inst.opcode == 0x3E:
-                text = f"/*v2@{inst.opcode_ext:02X} {inst.asdword:08X}*/ d:r{inst.dst} s:r{inst.src} x:{inst.ext} imm:{inst.imm}"
+                    case TiktokOps.V2_SHR_X:
+                        text = f"r{inst.ext} = r{inst.dst} >> {inst.imm|0x20};"
+                    case TiktokOps.V2_SHR:
+                        text = f"r{inst.ext} = r{inst.dst} >> {inst.imm};"
+            elif inst.opcode == TiktokOps.V2_OPCODE2:
+                text = f'puts("/*v2@{inst.opcode_ext:02X} {inst.asdword:08X}*/ d:r{inst.dst} s:r{inst.src} x:{inst.ext} imm:{inst.imm})"'
                 match inst.opcode_ext:
                     case 0x17:
                         mask = ~(-1 << (inst.ext + 1))
@@ -266,65 +258,75 @@ def decompile(vm: VMInfo, gen_c=False):
                         text = f"r{inst.dst} = r{inst.dst} & {hex(mask1)} | (r{inst.src} & {hex(mask2)}) << {inst.imm} | r{inst.dst} & {hex(mask3)};"
         else:
             imm_s = c_int16(inst.imm).value
-            text = f"/*v1 {inst.opcode:02X} {inst.asdword:08X}*/ d:r{inst.dst} s:r{inst.src} imm:0x{inst.imm:04X}"
+            text = f'puts("/*v1 {inst.opcode:02X} {inst.asdword:08X}*/ d:r{inst.dst} s:r{inst.src} imm:0x{inst.imm:04X}");'
             match inst.opcode:
-                case 0x0F:
+                case TiktokOps.V1_MOVH:
                     text = f"r{inst.dst} = {hex(imm_s<<16)};"
-                case 0x03:
-                    # float handler
-                    pass
-                case 0x04:
-                    target = pc + 4 + imm_s * 4
-                    text = f"if (r{inst.dst} != r{inst.src}) goto {label(target)};"
-                case 0x00:
+                # case 0x03:
+                #     # float handler
+                #     pass
+                case TiktokOps.V1_JUMP_EQ | TiktokOps.V1_JUMP_EQ_1:
                     target = pc + 4 + imm_s * 4
                     text = f"if (r{inst.dst} == r{inst.src}) goto {label(target)};"
-                case 0x05:
+                case TiktokOps.V1_JUMP_NE | TiktokOps.V1_JUMP_NE_1:
                     target = pc + 4 + imm_s * 4
-                    text = f"if ((int64_t)r{inst.src} < 1) goto {label(target)};"
-                case 0x0B:
+                    text = f"if (r{inst.dst} != r{inst.src}) goto {label(target)};"
+                case TiktokOps.V1_JUMP_GT_ZERO | TiktokOps.V1_JUMP_GT_ZERO_1:
                     target = pc + 4 + imm_s * 4
                     text = f"if ((int64_t)r{inst.src} > 0) goto {label(target)};"
-                case 0x20:
+                case TiktokOps.V1_JUMP_LE_ZERO | TiktokOps.V1_JUMP_LE_ZERO_1:
+                    target = pc + 4 + imm_s * 4
+                    text = f"if ((int64_t)r{inst.src} <= 0) goto {label(target)};"
+                case TiktokOps.V1_ADD | TiktokOps.V1_ADD_1:
+                    if inst.dst == inst.src and inst.dst == 29:
+                        stack_size = abs(imm_s)
                     text = f"r{inst.dst} = r{inst.src} + {hex(imm_s)};"
-                case 0x39:
-                    text = f"r{inst.dst} = r{inst.src} + {hex(imm_s)};"
-                case 0x2F:
+                case TiktokOps.V1_ADD_I32:
                     text = f"r{inst.dst} = (int32_t)r{inst.src} + (int64_t){hex(imm_s)};"
-                case 0x09:
+                case TiktokOps.V1_JUMP | TiktokOps.V1_JUMP_1:
                     text = f"goto {label(vm.vmentry+inst.imm_ext*4)};"
-                case 0x24:
+                case TiktokOps.V1_CMP:
                     text = f"r{inst.dst} = (int64_t)r{inst.src} < {imm_s};"
-                case 0x1E:
+                case TiktokOps.V1_READ_I8:
                     text = f"r{inst.dst} = *(int8_t *)(r{inst.src}+{hex(imm_s)});"
-                case 0x2D:
+                case TiktokOps.V1_READ_I32:
                     text = f"r{inst.dst} = *(int32_t *)(r{inst.src}+{hex(imm_s)});"
-                case 0x37:
+                case TiktokOps.V1_READ_U8:
                     text = f"r{inst.dst} = *(uint8_t *)(r{inst.src}+{hex(imm_s)});"
-                case 0x0E:
+                case TiktokOps.V1_READ_U16:
                     text = f"r{inst.dst} = *(uint16_t *)(r{inst.src}+{hex(imm_s)});"
-                case 0x12:
+                case TiktokOps.V1_READ_U32:
                     text = f"r{inst.dst} = *(uint32_t *)(r{inst.src}+{hex(imm_s)});"
-                case 0x07:
-                    # if vm.g_vars and inst.src == 5:
-                    #     text = f"r{inst.dst} = {hex(ida_bytes.get_qword(vm.g_vars+inst.imm))}; // replace: *(uint64_t *)(r{inst.src}+{hex(inst.imm)})"
-                    # elif vm.funcs and inst.src == 6:
-                    #     text = f"r{inst.dst} = {hex(ida_bytes.get_qword(vm.funcs+inst.imm))}; // replace: *(uint64_t *)(r{inst.src}+{hex(inst.imm)})"
-                    # else:
+                case TiktokOps.V1_READ_U64:
+                    enc_addr = 0
                     text = f"r{inst.dst} = *(uint64_t *)(r{inst.src}+{hex(inst.imm)});"
-                case 0x15:
+                    if vm.g_vars and inst.src == 5:
+                        # enc_addr = ida_bytes.get_qword(vm.g_vars+inst.imm)
+                        text = f"r{inst.dst} = {hex(ida_bytes.get_qword(vm.g_vars+inst.imm))};"
+                    elif vm.funcs and inst.src == 6:
+                        # enc_addr = ida_bytes.get_qword(vm.funcs+inst.imm)
+                        text = f"r{inst.dst} = {hex(ida_bytes.get_qword(vm.funcs+inst.imm))};"
+                case TiktokOps.V1_WRITE_U8:
                     text = f"*(uint8_t *)(r{inst.src}+{hex(imm_s)}) = r{inst.dst};"
-                case 0x3F:
+                case TiktokOps.V1_WRITE_U16:
                     text = f"*(uint16_t *)(r{inst.src}+{hex(imm_s)}) = r{inst.dst};"
-                case 0x06:
+                case TiktokOps.V1_WRITE_U32:
                     text = f"*(uint32_t *)(r{inst.src}+{hex(imm_s)}) = r{inst.dst};"
-                case 0x38:
+                case TiktokOps.V1_WRITE_U64:
                     text = f"*(uint64_t *)(r{inst.src}+{hex(imm_s)}) = r{inst.dst};"
-                case 0x33:
+                case TiktokOps.V1_WRITE_U64_SHL:
+                    offset = imm_s & 0xFFF8
+                    shift = imm_s % 8
+                    text = f"*(uint64_t *)(r{inst.src}+{offset}) = r{inst.dst} << {shift*8};"
+                case TiktokOps.V1_WRITE_U64_SHR:
+                    offset = imm_s & 0xFFF8
+                    shift = imm_s % 8
+                    text = f"*(uint64_t *)(r{inst.src}+{offset}) = r{inst.dst} >> {(8-shift-1)*8};"
+                case TiktokOps.V1_AND:
                     text = f"r{inst.dst} = r{inst.src} & {hex(inst.imm)};"
-                case 0x1A:
+                case TiktokOps.V1_OR:
                     text = f"r{inst.dst} = r{inst.src} | {hex(inst.imm)};"
-                case 0x0A:
+                case TiktokOps.V1_XOR:
                     text = f"r{inst.dst} = r{inst.src} ^ {hex(inst.imm)};"
         pcodes.append(Pcode(f"{label(pc)}: ", text))
 
@@ -341,14 +343,120 @@ def decompile(vm: VMInfo, gen_c=False):
         print(pcodes[i])
         s += str(pcodes[i])+"\n"
     s = s.rstrip('\n')
-
+    source = templ_obj.substitute(
+        name=f'foo_{vm.vmentry:08X}', stack_size=hex(stack_size), pcode=s)
     if gen_c:
         open(f"vm_{vm.vmentry:08X}_{vm.size}.c", "w").write(
-            templ_obj.substitute(name=f'foo_{vm.vmentry:08X}', pcode=s))
+            headers + source + footers)
         # 生成后直接用gcc编译, 然后使用IDA打开分析.
+    return source
 
 
-decompile(vms[2], ida_kernwin.ask_yn(0, 'gen c file?') == 1)
+def parse_expr(expr):
+    n = None
+    if expr.op == idaapi.cot_num:
+        n = expr.numval()
+    elif expr.op == idaapi.cot_obj:
+        n = expr.obj_ea
+    elif expr.op == idaapi.cot_cast:
+        n = parse_expr(expr.x)
+    elif expr.op == idaapi.cot_var:
+        pass
+    elif expr.op == idaapi.cot_ref:
+        n = parse_expr(expr.x)
+    else:
+        raise Exception('ERROR ' + expr.opname + str(expr.operands))
+    return n
 
-# for vm in vms:
-#     decompile(vm, True)
+
+class my_super_visitor(ida_hexrays.ctree_visitor_t):
+    def __init__(self):
+        # CV_FAST does not keep parents nodes in CTREE
+        ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+        self.calls = []
+
+    def visit_insn(self, i):
+        return 0
+
+    def visit_expr(self, e):
+        if e.op != ida_hexrays.cot_call:
+            return 0
+        if e.x.obj_ea == BADADDR:
+            return 0
+        if e.a.size() in [5, 6]:
+            args = tuple(parse_expr(arg) for arg in e.a)
+            self.calls.append((e.x.obj_ea, args))
+        return 0
+
+
+def decompile_here():
+    func = idaapi.get_func(here())
+    cfunc = idaapi.decompile(func, None, idaapi.DECOMP_NO_CACHE)
+    v = my_super_visitor()
+    v.apply_to(cfunc.body, None)
+    for ea, args in v.calls:
+        vm_info = VMInfo(args[0], get_item_size(args[0])//4, args[2], args[3])
+        print(vm_info)
+        decompile(vm_info, ida_kernwin.ask_yn(
+            0, 'gen c file?') == ida_kernwin.ASKBTN_BTN1)
+        break
+
+
+def decompile_batch(vm_infos, output):
+    source = ''
+    source += headers
+    for vm_info in vm_infos:
+        source += decompile(vm_info, False)
+    source += footers
+
+    open(output, "w").write(source)
+
+
+def find_all(p, start_ea=None, end_ea=None):
+    start_ea = start_ea or ida_ida.inf_get_min_ea()
+    end_ea = end_ea or ida_ida.inf_get_max_ea()
+    ea = start_ea
+    while True:
+        ea = ida_search.find_binary(
+            ea, end_ea, p, 16, SEARCH_DOWN | SEARCH_NEXT | SEARCH_CASE)
+        if ea == BADADDR:
+            break
+        yield ea
+
+
+def find_vm() -> list[VMInfo]:
+    vm_infos = []
+    processed = set()
+    for vm_stub in find_all('E2 03 00 AA E0 03 01 AA 40 00 1F D6'):
+        print(f'======stub:{vm_stub:08X}======')
+        for xref in idautils.XrefsTo(vm_stub):
+            func = idaapi.get_func(xref.frm)
+            if func:
+                if func.start_ea not in processed:
+                    processed.add(func.start_ea)
+                    print(f'func {func.start_ea:08X}')
+                    cfunc = idaapi.decompile(
+                        func, None, idaapi.DECOMP_NO_CACHE)
+                    v = my_super_visitor()
+                    v.apply_to(cfunc.body, None)
+                    for ea, args in v.calls:
+                        apply_type(ea, parse_decl(
+                            'void __fastcall f(uint32_t *p_bytecode, void *p_args, uint64_t *g_vals, uint64_t *p_funcs, void *pfn_callstub)', 0))
+                        idaapi.decompile(func, None, idaapi.DECOMP_NO_CACHE)
+                        vm_info = VMInfo(args[0], get_item_size(
+                            args[0])//4, args[2], args[3])
+                        print(vm_info)
+                        vm_infos.append(vm_info)
+            else:
+                print('[OOPS]')
+    return vm_infos
+
+
+def decompile_all(output='vm_all.c'):
+    vm_infos = find_vm()
+    decompile_batch(vm_infos, output)
+
+
+# gcc vm_all.c -o vm_all -O2 -g -fno-stack-protector
+decompile_all()
+# decompile_here()
